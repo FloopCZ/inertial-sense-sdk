@@ -125,14 +125,27 @@ InertialSense::InertialSense(
         pfnIsCommGenMsgHandler handlerRtcm3,
         pfnIsCommGenMsgHandler handlerSpartn ) : m_tcpServer(this)
 {
-    s_is = this;
-    s_cm_state = &m_comManagerState;
-    m_logThread = NULLPTR;
-    m_lastLogReInit = time(0);
-    m_clientStream = NULLPTR;
-    m_clientBufferBytesToSend = 0;
-    m_clientServerByteCount = 0;
-    m_disableBroadcastsOnClose = false;  // For Intellian
+	m_logThread = NULLPTR;
+	m_lastLogReInit = time(0);
+	m_clientReconnectOnFailure = false;
+	m_clientStream = NULLPTR;
+	m_clientBufferBytesToSend = 0;
+	m_clientServerByteCount = 0;
+    m_disableBroadcastsOnClose = false;
+	for(int i=0; i<int(sizeof(m_comManagerState.binaryCallback)/sizeof(pfnHandleBinaryData)); i++)
+	{
+		m_comManagerState.binaryCallback[i] = {};
+	}
+	m_comManagerState.binaryCallbackGlobal = handlerIsb;
+	m_comManagerState.stepLogFunction = &InertialSense::StepLogger;
+	m_comManagerState.inertialSenseInterface = this;
+	m_comManagerState.clientBuffer = m_clientBuffer;
+	m_comManagerState.clientBufferSize = sizeof(m_clientBuffer);
+	m_comManagerState.clientBytesToSend = &m_clientBufferBytesToSend;
+	comManagerAssignUserPointer(comManagerGetGlobal(), &m_comManagerState);
+	memset(&m_cmInit, 0, sizeof(m_cmInit));
+	m_cmPorts = NULLPTR;
+	is_comm_init(&m_gpComm, m_gpCommBuffer, sizeof(m_gpCommBuffer));
 
     for(int i=0; i<int(sizeof(m_comManagerState.binaryCallback)/sizeof(pfnHandleBinaryData)); i++)
     {
@@ -356,20 +369,27 @@ bool InertialSense::SetLoggerEnabled(
 }
 
 // [type]:[protocol]:[ip/url]:[port]:[mountpoint]:[username]:[password]
-bool InertialSense::OpenConnectionToServer(const string& connectionString)
+bool InertialSense::OpenConnectionToServer(const string& connectionString, bool reconnectOnFailure)
 {
     CloseServerConnection();
 
-    // calls new cISTcpClient or new cISSerialPort
-    m_clientStream = cISClient::OpenConnectionToServer(connectionString, &m_forwardGpgga);
+	m_clientConnectionString = connectionString;
+	m_clientReconnectOnFailure = reconnectOnFailure;
+	// calls new cISTcpClient or new cISSerialPort
+	m_clientStream = cISClient::OpenConnectionToServer(connectionString, &m_forwardGpgga);
 
     return m_clientStream!=NULLPTR;
 }
 
 void InertialSense::CloseServerConnection()
 {
-    m_tcpServer.Close();
-    m_serialServer.Close();
+	if (m_clientStreamReconnector.valid())
+	{
+		m_clientStream = m_clientStreamReconnector.get();
+	}
+
+	m_tcpServer.Close();
+	m_serialServer.Close();
 
     if (m_clientStream != NULLPTR)
     {
@@ -541,15 +561,32 @@ bool InertialSense::UpdateServer()
 
 bool InertialSense::UpdateClient()
 {
-    if (m_clientStream == NULLPTR)
-    {
-        return false;
-    }
+	// Reconnection in progress
+	if (m_clientStreamReconnector.valid())
+	{
+		std::future_status status = m_clientStreamReconnector.wait_for(std::chrono::seconds{0});
+		if (status != std::future_status::ready) return false;
+		m_clientStream = m_clientStreamReconnector.get();
+	}
 
-    // Forward only valid uBlox and RTCM3 packets
-    is_comm_instance_t *comm = &(m_gpComm);
-    protocol_type_t ptype = _PTYPE_NONE;
-    static int error = 0;
+	if (m_clientStream == NULLPTR)
+	{
+		return false;
+	}
+
+	if (!m_clientStream->IsOpen() && m_clientReconnectOnFailure)
+	{
+		CloseServerConnection();
+		m_clientStreamReconnector = std::async(std::launch::async, [this]() {
+			return cISClient::OpenConnectionToServer(m_clientConnectionString, &m_forwardGpgga);
+		});
+		return false;
+	}
+
+	// Forward only valid uBlox and RTCM3 packets
+	is_comm_instance_t *comm = &(m_gpComm);
+	protocol_type_t ptype = _PTYPE_NONE;
+	static int error = 0;
 
     // Get available size of comm buffer.  is_comm_free() modifies comm->rxBuf pointers, call it before using comm->rxBuf.tail.
     int n = is_comm_free(comm);
