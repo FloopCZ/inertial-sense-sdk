@@ -19,6 +19,9 @@ THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLI
 #include "protocol/FirmwareUpdate.h"
 #include "imx_defaults.h"
 
+#include <chrono>
+#include <thread>
+
 using namespace std;
 
 #define PRINT_DEBUG 0
@@ -574,6 +577,7 @@ bool InertialSense::UpdateClient()
 	{
 		CloseServerConnection();
 		m_clientStreamReconnector = std::async(std::launch::async, [this]() {
+			std::this_thread::sleep_for(std::chrono::milliseconds{IS_SOCKET_DEFAULT_TIMEOUT_MS});
 			return cISClient::OpenConnectionToServer(m_clientConnectionString, &m_forwardGpgga);
 		});
 		return false;
